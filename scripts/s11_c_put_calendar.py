@@ -94,6 +94,7 @@ def main():
     put['stock_id'] = put['bond'].str[:4]
 
     conv = pd.read_parquet(CB_DIR / 'cb_conv_price_monthly.parquet')
+    conv = conv.drop_duplicates(['bond', 'ym'], keep='last')
     conv_map = conv.set_index(['bond', 'ym'])['conv_price']
 
     bm = load_price('TAIEX')
