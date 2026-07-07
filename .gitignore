@@ -1,5 +1,7 @@
 .env
 data/
-results/
 __pycache__/
 *.parquet
+# results:判讀報告(.md)進版控,數據檔不進
+results/*
+!results/*.md
