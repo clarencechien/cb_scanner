@@ -203,7 +203,7 @@ def parse_rsta0113(path):
         elif tag == 'BODY':
             body = cells[1:]
             code = body[0].strip()
-            if code:                      # 等價列(帶代號)
+            if re.fullmatch(r'\d{5,6}', code):   # 等價列(帶代號;排除合計列)
                 cur = body
                 rows.append(body)
             elif cur is not None:
