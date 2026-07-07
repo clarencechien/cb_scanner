@@ -15,8 +15,12 @@ H-A:CB 發行後 6–18 個月,正股相對大盤有系統性正超額(發行人
 
 進場:事件日後首個交易日(T+1)開盤價(鐵律 #5)。
 報酬:T+1 開盤 → T+1+h 收盤,h ∈ {20, 60, 120, 250} 交易日。
-超額:同視窗 TAIEX 同法計算,相減(鐵律 #7:對照同時段)。
-輸出:results/s11_a_event_study.md
+超額:三個基準並列(鐵律 #7:對照同時段)——
+  xM = vs TAIEX(加權指數;大型股偏誤,2025-26 瘋牛時會高估負超額)
+  xO = vs TPEx 櫃買指數(CB 發行人多為中小/上櫃,較貼)
+  xE = vs 等權發行人指數(全體 CB 發行人日均報酬累積;近似值,
+       視窗為 entry 日收盤起算,差一個進場日盤中,20d+ 視窗可忽略)
+輸出:results/s11_a_raw_tables.md
 """
 import re
 import sys
@@ -133,6 +137,36 @@ def build_events():
     return ev
 
 
+def build_ew_index():
+    """等權 CB 發行人指數:全體已抓正股 close-to-close 日均報酬累積。"""
+    rets = []
+    for p in ST_DIR.glob('price_*.parquet'):
+        sid = p.stem.replace('price_', '')
+        if sid in ('TAIEX', 'TPEX_INDEX'):
+            continue
+        df = pd.read_parquet(p)[['date', 'close']]
+        df['date'] = pd.to_datetime(df['date'])
+        s = pd.to_numeric(df.set_index('date')['close'], errors='coerce')
+        s[s <= 0] = np.nan
+        r = s.sort_index().pct_change()
+        r = r.replace([np.inf, -np.inf], np.nan)
+        # 鐵律 #3:單日 |r|>40% 視為分割/減資殘影,不入指數
+        r[r.abs() > 0.4] = np.nan
+        rets.append(r.rename(sid))
+    mat = pd.concat(rets, axis=1)
+    ew = mat.mean(axis=1, skipna=True)
+    level = (1 + ew.fillna(0)).cumprod()
+    return level
+
+
+def ew_window_return(level, entry_date, h):
+    idx = level.index
+    pos = idx.searchsorted(pd.Timestamp(entry_date))
+    if pos >= len(idx) or pos + h >= len(idx):
+        return np.nan
+    return level.iloc[pos + h] / level.iloc[pos] - 1
+
+
 def summarize(df, col):
     x = df[col].dropna().astype(float)
     if len(x) < 5:
@@ -144,9 +178,12 @@ def summarize(df, col):
 
 
 def main():
-    bench = load_price('TAIEX')
-    if bench is None:
-        sys.exit('缺 TAIEX,先跑 s11_a_fetch_stocks.py')
+    bench_m = load_price('TAIEX')
+    bench_o = load_price('TPEX_INDEX')
+    if bench_m is None or bench_o is None:
+        sys.exit('缺 TAIEX / TPEX_INDEX,先跑 s11_a_fetch_stocks.py')
+    print('建等權發行人指數...')
+    ew = build_ew_index()
     ev = build_events()
     print(f'事件數:{ev.groupby("variant").size().to_dict()}')
 
@@ -158,25 +195,29 @@ def main():
             miss.add(e.stock_id)
             continue
         fr = fwd_returns(px, e.date, HORIZONS)
-        fb = fwd_returns(bench, e.date, HORIZONS)
-        if fr is None or fb is None:
+        fm = fwd_returns(bench_m, e.date, HORIZONS)
+        fo = fwd_returns(bench_o, e.date, HORIZONS)
+        if fr is None or fm is None or fo is None:
             continue
         pos = px.index.searchsorted(fr['entry_date'])
         split = detect_split(px, pos, min(pos + 250, len(px) - 1),
-                             bench['close'])
+                             bench_m['close'])
         row = {'bond': e.bond, 'stock_id': e.stock_id, 'date': e.date,
                'variant': e.variant, 'suspect_split': split}
         for h in HORIZONS:
-            rh, bh = fr[h], fb[h]
+            rh = fr[h]
             row[f'r{h}'] = rh
-            ok = pd.notna(rh) and pd.notna(bh)
-            row[f'x{h}'] = (rh - bh) if ok else np.nan
+            for tag, bh in [('M', fm[h]), ('O', fo[h]),
+                            ('E', ew_window_return(ew, fr['entry_date'], h))]:
+                ok = pd.notna(rh) and pd.notna(bh)
+                row[f'x{tag}{h}'] = (rh - bh) if ok else np.nan
         rows.append(row)
     res = pd.DataFrame(rows)
     res.to_parquet(RES / 's11_a_events.parquet')
     print(f'有價格可算的事件:{len(res)};缺價格股票 {len(miss)} 檔')
 
-    lines = ['# S11-A 發行日事件研究(自動輸出)\n']
+    lines = ['# S11-A 發行日事件研究(自動輸出)\n',
+             '超額基準:xM=加權指數、xO=櫃買指數、xE=等權CB發行人指數\n']
     for var in ['V1', 'V2']:
         sub = res[(res.variant == var) & (~res.suspect_split)]
         lines.append(f'\n## {var}(排除疑似分割 '
@@ -184,18 +225,26 @@ def main():
         for era, lo, hi in ERAS + [('全期', '2013-01-01', '2026-12-31')]:
             seg = sub[(sub.date >= lo) & (sub.date <= hi)]
             lines.append(f'\n### {era}(n={len(seg)})\n')
-            lines.append('| h | n | 超額mean | 超額median | 勝率 | P10 | P90 | t |')
-            lines.append('|---|---|---|---|---|---|---|---|')
+            lines.append('| h | n | 原始mean | 原始med | xM med | xO mean '
+                         '| xO med | xO 勝率 | xO P10/P90 | xO t | xE med |')
+            lines.append('|---|---|---|---|---|---|---|---|---|---|---|')
             for h in HORIZONS:
-                s = summarize(seg, f'x{h}')
-                if s:
-                    lines.append(
-                        f'| {h}d | {s["n"]} | {s["mean"]*100:+.1f}% '
-                        f'| {s["median"]*100:+.1f}% | {s["win"]*100:.0f}% '
-                        f'| {s["p10"]*100:+.1f}% | {s["p90"]*100:+.1f}% '
-                        f'| {s["t"]:+.1f} |')
-                else:
-                    lines.append(f'| {h}d | <5 | - | - | - | - | - | - |')
+                sO = summarize(seg, f'xO{h}')
+                if not sO:
+                    lines.append(f'| {h}d | <5 | - | - | - | - | - | - | - | - | - |')
+                    continue
+                sR = summarize(seg, f'r{h}')
+                sM = summarize(seg, f'xM{h}')
+                sE = summarize(seg, f'xE{h}')
+                lines.append(
+                    f'| {h}d | {sO["n"]} '
+                    f'| {sR["mean"]*100:+.1f}% | {sR["median"]*100:+.1f}% '
+                    f'| {sM["median"]*100:+.1f}% '
+                    f'| {sO["mean"]*100:+.1f}% | {sO["median"]*100:+.1f}% '
+                    f'| {sO["win"]*100:.0f}% '
+                    f'| {sO["p10"]*100:+.1f}%/{sO["p90"]*100:+.1f}% '
+                    f'| {sO["t"]:+.1f} '
+                    f'| {(sE["median"]*100 if sE else float("nan")):+.1f}% |')
     (RES / 's11_a_raw_tables.md').write_text('\n'.join(lines))
     print('→ results/s11_a_raw_tables.md / s11_a_events.parquet')
 
